@@ -35,6 +35,7 @@ import mmap
 import operator
 import os
 import shutil
+import subprocess
 import tempfile
 import time
 import uuid
@@ -500,6 +501,8 @@ class LibvirtDriver(driver.ComputeDriver):
         self.job_tracker = instancejobtracker.InstanceJobTracker()
         self._remotefs = remotefs.RemoteFilesystem()
 
+        self._socat_consoles = dict()
+
     def _get_volume_drivers(self):
         return libvirt_volume_drivers
 
@@ -928,9 +931,24 @@ class LibvirtDriver(driver.ComputeDriver):
         if CONF.serial_console.enabled:
             try:
                 guest = self._host.get_guest(instance)
-                serials = self._get_serial_ports_from_guest(guest)
-                for hostname, port in serials:
-                    serial_console.release_port(host=hostname, port=port)
+                if CONF.libvirt.virt_type in ("qemu", "kvm"):
+                    # Destroy serial consoles
+                    serials = self._get_serial_ports_from_guest(guest)
+                    for hostname, port in serials:
+                        serial_console.release_port(host=hostname, port=port)
+                else:
+                    # Destroy socat console
+                    if guest.name in self._socat_consoles:
+                        console = self._socat_consoles[guest.name]
+                        del self._socat_consoles[guest.name]
+
+                        proc = console["proc"]
+                        if proc and not proc.poll():
+                            proc.terminate()
+                        hostname = console["host"]
+                        port = console["port"]
+
+                        serial_console.release_port(host=hostname, port=port)
             except exception.InstanceNotFound:
                 pass
 
@@ -2661,12 +2679,52 @@ class LibvirtDriver(driver.ComputeDriver):
 
         return ctype.ConsoleSpice(host=host, port=ports[0], tlsPort=ports[1])
 
+    def _get_socat_console(self, guest):
+        # Clean up
+        for guest_name, console in self._socat_consoles.iteritems():
+            proc = console["proc"]
+            if proc and proc.poll:
+                if proc.returncode:
+                    LOG.warn("socat terminated with exit code %d",
+                             proc.returncode)
+                console["proc"] = None
+
+        # Reserve console if necessary
+        if not guest.name in self._socat_consoles:
+            listen_host = CONF.serial_console.listen
+            listen_port = serial_console.acquire_port(listen_host)
+            self._socat_consoles[guest.name] = dict(host=listen_host,
+                                                    port=listen_port,
+                                                    proc=None)
+
+        # Launch console if necessary
+        console = self._socat_consoles[guest.name]
+        if not console["proc"]:
+            tcp_addr = "tcp-listen:" + str(console["port"]) + ",bind=" + console["host"] + ",reuseaddr"
+            exec_addr = "exec:virsh -c " + CONF.libvirt.virt_type + "\\:// console " + guest.name + ",pty"
+
+            args = ["socat", tcp_addr, exec_addr]
+
+            try:
+                console["proc"] = subprocess.Popen(args)
+            except OSError as e:
+                LOG.warn("Unable to launch socat: %s", e)
+
+        # Return meta data
+        if console["proc"]:
+            return ctype.ConsoleSerial(host=console["host"], port=console["port"])
+
+        raise exception.ConsoleTypeUnavailable(console_type="serial")
+
     def get_serial_console(self, context, instance):
         guest = self._host.get_guest(instance)
-        for hostname, port in self._get_serial_ports_from_guest(
-                guest, mode='bind'):
-            return ctype.ConsoleSerial(host=hostname, port=port)
-        raise exception.ConsoleTypeUnavailable(console_type='serial')
+        if CONF.libvirt.virt_type in ("qemu", "kvm"):
+            for hostname, port in self._get_serial_ports_from_guest(
+                    guest, mode='bind'):
+                return ctype.ConsoleSerial(host=hostname, port=port)
+            raise exception.ConsoleTypeUnavailable(console_type='serial')
+        else:
+            return self._get_socat_console(guest)
 
     @staticmethod
     def _supports_direct_io(dirpath):
@@ -4109,6 +4167,7 @@ class LibvirtDriver(driver.ComputeDriver):
             else:
                 consolepty = vconfig.LibvirtConfigGuestSerial()
         else:
+            # Console is created on demand with socat
             consolepty = vconfig.LibvirtConfigGuestConsole()
         return consolepty
 
