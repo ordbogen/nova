@@ -942,7 +942,7 @@ class LibvirtDriver(driver.ComputeDriver):
                         del self._socat_consoles[guest.name]
 
                         proc = console["proc"]
-                        if proc and not proc.poll():
+                        if proc and proc.poll() is None:
                             proc.terminate()
                         hostname = console["host"]
                         port = console["port"]
@@ -2612,7 +2612,7 @@ class LibvirtDriver(driver.ComputeDriver):
         # Clean up
         for guest_name, console in self._socat_consoles.iteritems():
             proc = console["proc"]
-            if proc and proc.poll():
+            if proc and proc.poll() is not None:
                 if proc.returncode:
                     LOG.warn(_LW("socat terminated with exit code %d"),
                              proc.returncode)
