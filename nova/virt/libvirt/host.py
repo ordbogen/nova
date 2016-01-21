@@ -190,6 +190,104 @@ class DomainJobInfo(object):
         else:
             return cls._get_job_stats_compat(dom)
 
+class ConsoleServer(object):
+    """Expose console to instance through TCP"""
+    def __init__(self, host, instance, port):
+        self.host = host
+        self.instance = instance
+        self.port = port
+
+        self._server_sock = None
+        self._server_watch = None
+        self._session_sock = None
+        self._session_watch = None
+        self._stream = None
+        self._stream_watch = None
+        self._console = None
+
+        self._create_server()
+
+    def _create_server(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((CONF.serial_console.listen, self.port))
+        sock.listen(127)
+
+        watch = libvirt.virEventAddHandle(sock.fileno(),
+                                          libvirt.VIR_EVENT_HANDLE_READABLE,
+                                          self._on_incoming_connection,
+                                          self)
+        self._server_sock = sock
+        self._server_watch = watch
+
+    @staticmethod
+    def _on_incoming_connection(watch, fd, events, self):
+        sock, addr = self._server_sock.accept()
+
+        if self._session_sock is not None:
+            sock.sendall("Console already active on another session\n")
+            sock.close()
+        elif self._open_console():
+            sock.setblocking(False)
+            watch = libvirt.virEventAddHandle(sock.fileno(),
+                                              libvirt.VIR_EVENT_HANDLE_READABLE,
+                                              self._on_socket_data,
+                                              self)
+            self._session_sock = sock
+            self._session_watch = watch
+        else:
+            sock.sendall("Failed to established connection to console\n")
+            sock.close()
+
+    def _open_console(self):
+        dom = self.host.get_domain(instance)
+
+        self._stream = dom.newStream(libvirt.VIR_STREAM_NONBLOCK)
+        self._console = dom.openConsole(None, self._stream, 0)
+
+        watch = self._stream.eventAddCallback(libvirt.VIR_STREAM_EVENT_READABLE,
+                                              self._on_stream_data,
+                                              self)
+        self._stream_watch = watch
+
+    @staticmethod
+    def _on_socket_data(watch, fd, events, self):
+        chunk = self._session_sock.recv(1024)
+        if len(chunk) == 0:
+            self._close_session()
+        else:
+            self._stream.send(chunk)
+
+    @staticmethod
+    def _on_stream_data(stream, events, self):
+        chunk = self._stream.recv(1024)
+        if len(chunk) == 0:
+            self._close_session()
+        else:
+            self._session_sock.sendall(chunk)
+
+    def _close_session():
+        if self._session_sock is not None:
+            libvirt.virEventRemoveHandle(self._session_watch)
+            self._session_watch = None
+            self._session_sock.close()
+            self._session_sock = None
+
+        if self._stream is not None:
+            libvirt.virEventRemoveHandle(self._stream_watch)
+            self._stream_watch = None
+            self._stream = None
+
+        self._console = None
+
+    def close():
+        self._close_session()
+
+        if self._server_sock is not None:
+            libvirt.virEventRemoveHandle(self._server_watch)
+            self._server_watch = None
+            self._server_sock.close()
+            self._server_sock = None
 
 class Host(object):
 
@@ -219,6 +317,8 @@ class Host(object):
         #                down the domain during a reboot, delay the
         #                STOPPED lifecycle event some seconds.
         self._lifecycle_delay = 15
+
+        self._consoles = dict()
 
     def _native_thread(self):
         """Receives async events coming in from libvirtd.
@@ -984,3 +1084,20 @@ class Host(object):
     def compare_cpu(self, xmlDesc, flags=0):
         """Compares the given CPU description with the host CPU."""
         return self.get_connection().compareCPU(xmlDesc, flags)
+
+    def get_console_port(self, instance):
+        if instance.name in self._consoles:
+            return self._consoles[instance.name].port
+        return None
+
+    def stop_console_server(self, instance):
+        if instance.name in self._consoles:
+            console = self._consoles[instance.name]
+            del self._consoles[instance.name]
+            console.close()
+
+    def start_console_server(self, instance, port):
+        if instance.name in self._consoles:
+            return
+
+        self._console[instance.name] = ConsoleServer(self, instance, port)
