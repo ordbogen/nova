@@ -1807,6 +1807,21 @@ class LibvirtConfigGuestFeatureHyperV(LibvirtConfigGuestFeature):
 
         return root
 
+class LibvirtConfigGuestFeatureCaps(LibvirtConfigGuestFeature):
+
+    def __init__(self, **kwargs):
+        super(LibvirtConfigGuestFeatureCaps, self).__init__("capabilities",
+                                                            **kwargs)
+
+        self.mknod = False
+
+    def format_dom(self):
+        caps = super(LibvirtConfigGuestFeatureCaps, self).format_dom()
+
+        if self.mknod:
+            caps.append(etree.Element("mknod", state="on"))
+
+        return caps
 
 class LibvirtConfigGuest(LibvirtConfigObject):
 

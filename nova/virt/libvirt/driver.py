@@ -271,7 +271,12 @@ libvirt_opts = [
                 default=[],
                 help='List of guid targets and ranges.'
                      'Syntax is guest-gid:host-gid:count'
-                     'Maximum of 5 allowed.')
+                     'Maximum of 5 allowed.'),
+    cfg.BoolOpt('allow_mknod',
+                default=False,
+                help='Allow LXC containers to create nodes with mknod. '
+                     'The actual devices are still restricted. '
+                     'Requires libvirt 1.2.7 or newer.')
     ]
 
 CONF = cfg.CONF
@@ -423,6 +428,9 @@ MIN_LIBVIRT_SET_ADMIN_PASSWD = (1, 2, 16)
 # s/390 & s/390x architectures with KVM
 MIN_LIBVIRT_KVM_S390_VERSION = (1, 2, 13)
 MIN_QEMU_S390_VERSION = (2, 3, 0)
+
+# LXC capabilities
+MIN_LIBVIRT_MKNOD_FEATURE_VERSION = (1, 2, 7)
 
 # Names of the types that do not get compressed during migration
 NO_COMPRESSION_TYPES = ('qcow2',)
@@ -3903,6 +3911,12 @@ class LibvirtDriver(driver.ComputeDriver):
                 hv.spinlock_retries = 8191
                 hv.vapic = True
             guest.features.append(hv)
+
+        if virt_type == "lxc":
+            if self._host.has_min_version(MIN_LIBVIRT_MKNOD_FEATURE_VERSION):
+                caps = vconfig.LibvirtConfigGuestFeatureCaps()
+                caps.mknod = CONF.libvirt.allow_mknod
+                guest.features.append(caps)
 
     def _create_serial_console_devices(self, guest, instance, flavor,
                                        image_meta):
