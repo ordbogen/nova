@@ -935,10 +935,16 @@ class LibvirtDriver(driver.ComputeDriver):
 
         if CONF.serial_console.enabled:
             try:
-                guest = self._host.get_guest(instance)
-                serials = self._get_serial_ports_from_guest(guest)
-                for hostname, port in serials:
-                    serial_console.release_port(host=hostname, port=port)
+                if CONF.libvirt.virt_type in ("qemu", "kvm"):
+                    guest = self._host.get_guest(instance)
+                    serials = self._get_serial_ports_from_guest(guest)
+                    for hostname, port in serials:
+                        serial_console.release_port(host=hostname, port=port)
+                else:
+                    port = self._host.get_console_port(instance)
+                    self._host.stop_console_server(instance)
+                    if port is not None:
+                        serial_console.release_port(host=hostname, port=port)
             except exception.InstanceNotFound:
                 pass
 
@@ -2670,9 +2676,17 @@ class LibvirtDriver(driver.ComputeDriver):
         return ctype.ConsoleSpice(host=host, port=ports[0], tlsPort=ports[1])
 
     def get_serial_console(self, context, instance):
-        guest = self._host.get_guest(instance)
-        for hostname, port in self._get_serial_ports_from_guest(
-                guest, mode='bind'):
+        if CONF.libvirt.virt_type in ("qemu", "kvm"):
+            guest = self._host.get_guest(instance)
+            for hostname, port in self._get_serial_ports_from_guest(
+                    guest, mode='bind'):
+                return ctype.ConsoleSerial(host=hostname, port=port)
+        else:
+            hostname = CONF.serial_console.proxyclient_address
+            port = self._host.get_console_port(instance)
+            if port is None:
+                port = serial_console.acquire_port(hostname)
+                self._host.start_console_server(instance, port)
             return ctype.ConsoleSerial(host=hostname, port=port)
         raise exception.ConsoleTypeUnavailable(console_type='serial')
 
