@@ -814,7 +814,7 @@ class ComputeManager(manager.Manager):
         """
         filters = {
             'source_compute': self.host,
-            'status': 'accepted',
+            'status': ['accepted', 'done'],
             'migration_type': 'evacuation',
         }
         evacuations = objects.MigrationList.get_by_filters(context, filters)
@@ -2045,7 +2045,8 @@ class ComputeManager(manager.Manager):
         except (exception.FlavorDiskTooSmall,
                 exception.FlavorMemoryTooSmall,
                 exception.ImageNotActive,
-                exception.ImageUnacceptable) as e:
+                exception.ImageUnacceptable,
+                exception.InvalidDiskInfo) as e:
             self._notify_about_instance_usage(context, instance,
                     'create.error', fault=e)
             raise exception.BuildAbortException(instance_uuid=instance.uuid,
@@ -2295,10 +2296,19 @@ class ComputeManager(manager.Manager):
                           instance=instance)
             except (cinder_exception.EndpointNotFound,
                     keystone_exception.EndpointNotFound) as exc:
-                LOG.warning(_LW('Ignoring EndpointNotFound: %s'), exc,
+                LOG.warning(_LW('Ignoring EndpointNotFound for '
+                                'volume %(volume_id)s: %(exc)s'),
+                            {'exc': exc, 'volume_id': bdm.volume_id},
                             instance=instance)
             except cinder_exception.ClientException as exc:
-                LOG.warning(_LW('Ignoring Unknown cinder exception: %s'), exc,
+                LOG.warning(_LW('Ignoring unknown cinder exception for '
+                                'volume %(volume_id)s: %(exc)s'),
+                            {'exc': exc, 'volume_id': bdm.volume_id},
+                            instance=instance)
+            except Exception as exc:
+                LOG.warning(_LW('Ignoring unknown exception for '
+                                'volume %(volume_id)s: %(exc)s'),
+                            {'exc': exc, 'volume_id': bdm.volume_id},
                             instance=instance)
 
         if notify:
@@ -2774,7 +2784,8 @@ class ComputeManager(manager.Manager):
         if image_ref:
             image_meta = self.image_api.get(context, image_ref)
         else:
-            image_meta = {}
+            image_meta = utils.get_image_from_system_metadata(
+                instance.system_metadata)
 
         # This instance.exists message should contain the original
         # image_ref, not the new one.  Since the DB has been updated
@@ -4685,6 +4696,8 @@ class ComputeManager(manager.Manager):
                               context=context, instance=instance)
                 self.volume_api.roll_detaching(context, volume_id)
 
+        return connection_info
+
     def _detach_volume(self, context, volume_id, instance, destroy_bdm=True):
         """Detach a volume from an instance.
 
@@ -4728,8 +4741,46 @@ class ComputeManager(manager.Manager):
                 self.notifier.info(context, 'volume.usage',
                                    compute_utils.usage_volume_info(vol_usage))
 
-        self._driver_detach_volume(context, instance, bdm)
+        connection_info = self._driver_detach_volume(context, instance, bdm)
         connector = self.driver.get_volume_connector(instance)
+
+        if connection_info and not destroy_bdm and (
+           connector.get('host') != instance.host):
+            # If the volume is attached to another host (evacuate) then
+            # this connector is for the wrong host. Use the connector that
+            # was stored in connection_info instead (if we have one, and it
+            # is for the expected host).
+            stashed_connector = connection_info.get('connector')
+            if not stashed_connector:
+                # Volume was attached before we began stashing connectors
+                LOG.warning(_LW("Host mismatch detected, but stashed "
+                                "volume connector not found. Instance host is "
+                                "%(ihost)s, but volume connector host is "
+                                "%(chost)s."),
+                            {'ihost': instance.host,
+                             'chost': connector.get('host')})
+            elif stashed_connector.get('host') != instance.host:
+                # Unexpected error. The stashed connector is also not matching
+                # the needed instance host.
+                LOG.error(_LE("Host mismatch detected in stashed volume "
+                              "connector. Will use local volume connector. "
+                              "Instance host is %(ihost)s. Local volume "
+                              "connector host is %(chost)s. Stashed volume "
+                              "connector host is %(schost)s."),
+                          {'ihost': instance.host,
+                           'chost': connector.get('host'),
+                           'schost': stashed_connector.get('host')})
+            else:
+                # Fix found. Use stashed connector.
+                LOG.debug("Host mismatch detected. Found usable stashed "
+                          "volume connector. Instance host is %(ihost)s. "
+                          "Local volume connector host was %(chost)s. "
+                          "Stashed volume connector host is %(schost)s.",
+                          {'ihost': instance.host,
+                           'chost': connector.get('host'),
+                           'schost': stashed_connector.get('host')})
+                connector = stashed_connector
+
         self.volume_api.terminate_connection(context, volume_id, connector)
 
         if destroy_bdm:
@@ -5359,24 +5410,32 @@ class ComputeManager(manager.Manager):
         block_device_info = self._get_instance_block_device_info(context,
                                                                  instance)
 
-        self.driver.post_live_migration_at_destination(context, instance,
-                                            network_info,
-                                            block_migration, block_device_info)
-        # Restore instance state
-        current_power_state = self._get_power_state(context, instance)
-        node_name = None
-        prev_host = instance.host
         try:
-            compute_node = self._get_compute_info(context, self.host)
-            node_name = compute_node.hypervisor_hostname
-        except exception.ComputeHostNotFound:
-            LOG.exception(_LE('Failed to get compute_info for %s'), self.host)
+            self.driver.post_live_migration_at_destination(
+                context, instance, network_info, block_migration,
+                block_device_info)
+        except Exception:
+            with excutils.save_and_reraise_exception():
+                instance.vm_state = vm_states.ERROR
+                LOG.error(_LE('Unexpected error during post live migration at '
+                              'destination host.'), instance=instance)
         finally:
-            instance.host = self.host
-            instance.power_state = current_power_state
-            instance.task_state = None
-            instance.node = node_name
-            instance.save(expected_task_state=task_states.MIGRATING)
+            # Restore instance state and update host
+            current_power_state = self._get_power_state(context, instance)
+            node_name = None
+            prev_host = instance.host
+            try:
+                compute_node = self._get_compute_info(context, self.host)
+                node_name = compute_node.hypervisor_hostname
+            except exception.ComputeHostNotFound:
+                LOG.exception(_LE('Failed to get compute_info for %s'),
+                              self.host)
+            finally:
+                instance.host = self.host
+                instance.power_state = current_power_state
+                instance.task_state = None
+                instance.node = node_name
+                instance.save(expected_task_state=task_states.MIGRATING)
 
         # NOTE(tr3buchet): tear down networks on source host
         self.network_api.setup_networks_on_host(context, instance,

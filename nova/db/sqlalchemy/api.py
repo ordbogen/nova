@@ -1139,6 +1139,13 @@ def fixed_ip_associate(context, address, instance_uuid, network_id=None,
                            retry_on_request=True)
 def fixed_ip_associate_pool(context, network_id, instance_uuid=None,
                             host=None, virtual_interface_id=None):
+    """allocate a fixed ip out of a fixed ip network pool.
+
+    This allocates an unallocated fixed ip out of a specified
+    network. We sort by updated_at to hand out the oldest address in
+    the list.
+
+    """
     if instance_uuid and not uuidutils.is_uuid_like(instance_uuid):
         raise exception.InvalidUUID(uuid=instance_uuid)
 
@@ -1152,6 +1159,7 @@ def fixed_ip_associate_pool(context, network_id, instance_uuid=None,
                                filter_by(reserved=False).\
                                filter_by(instance_uuid=None).\
                                filter_by(host=None).\
+                               order_by(asc(models.FixedIp.updated_at)).\
                                first()
 
         if not fixed_ip_ref:
@@ -3494,11 +3502,11 @@ def _calculate_overquota(project_quotas, user_quotas, deltas,
     """
     overs = []
     for res, delta in deltas.items():
-        # We can't go over-quota if we're not reserving anything or if
-        # we have unlimited quotas.
-        if user_quotas[res] >= 0 and delta >= 0:
+        # We can't go over-quota if we're not reserving anything.
+        if delta >= 0:
+            # We can't go over-quota if we have unlimited quotas.
             # over if the project usage + delta is more than project quota
-            if project_quotas[res] < delta + project_usages[res]['total']:
+            if 0 <= project_quotas[res] < delta + project_usages[res]['total']:
                 LOG.debug('Request is over project quota for resource '
                           '"%(res)s". Project limit: %(limit)s, delta: '
                           '%(delta)s, current total project usage: %(total)s',
@@ -3506,8 +3514,9 @@ def _calculate_overquota(project_quotas, user_quotas, deltas,
                            'delta': delta,
                            'total': project_usages[res]['total']})
                 overs.append(res)
+            # We can't go over-quota if we have unlimited quotas.
             # over if the user usage + delta is more than user quota
-            elif user_quotas[res] < delta + user_usages[res]['total']:
+            elif 0 <= user_quotas[res] < delta + user_usages[res]['total']:
                 LOG.debug('Request is over user quota for resource '
                           '"%(res)s". User limit: %(limit)s, delta: '
                           '%(delta)s, current total user usage: %(total)s',
@@ -4474,8 +4483,9 @@ def migration_get_in_progress_by_host_and_node(context, host, node):
                             models.Migration.source_node == node),
                        and_(models.Migration.dest_compute == host,
                             models.Migration.dest_node == node))).\
-            filter(~models.Migration.status.in_(['confirmed', 'reverted',
-                                                 'error'])).\
+            filter(~models.Migration.status.in_(['accepted', 'confirmed',
+                                                 'reverted', 'error',
+                                                 'failed'])).\
             options(joinedload_all('instance.system_metadata')).\
             all()
 
@@ -4483,7 +4493,9 @@ def migration_get_in_progress_by_host_and_node(context, host, node):
 def migration_get_all_by_filters(context, filters):
     query = model_query(context, models.Migration)
     if "status" in filters:
-        query = query.filter(models.Migration.status == filters["status"])
+        status = filters["status"]
+        status = [status] if isinstance(status, str) else status
+        query = query.filter(models.Migration.status.in_(status))
     if "host" in filters:
         host = filters["host"]
         query = query.filter(or_(models.Migration.source_compute == host,

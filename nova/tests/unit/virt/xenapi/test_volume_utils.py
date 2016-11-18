@@ -241,6 +241,38 @@ class FindVBDTestCase(stubs.XenAPITestBaseNoDB):
         session.VBD.get_userdevice.assert_called_once_with("a")
 
 
+class IntroduceSRTestCase(stubs.XenAPITestBaseNoDB):
+    @mock.patch.object(volume_utils, '_create_pbd')
+    def test_backend_kind(self, create_pbd):
+        session = mock.Mock()
+        session.product_version = (6, 5, 0)
+        session.call_xenapi.return_value = 'sr_ref'
+        params = {'sr_type': 'iscsi'}
+        sr_uuid = 'sr_uuid'
+        label = 'label'
+        expected_params = {'backend-kind': 'vbd'}
+
+        volume_utils.introduce_sr(session, sr_uuid, label, params)
+        session.call_xenapi.assert_any_call('SR.introduce', sr_uuid,
+                                            label, '', 'iscsi',
+                                            '', False, expected_params)
+
+    @mock.patch.object(volume_utils, '_create_pbd')
+    def test_backend_kind_upstream_fix(self, create_pbd):
+        session = mock.Mock()
+        session.product_version = (7, 0, 0)
+        session.call_xenapi.return_value = 'sr_ref'
+        params = {'sr_type': 'iscsi'}
+        sr_uuid = 'sr_uuid'
+        label = 'label'
+        expected_params = {}
+
+        volume_utils.introduce_sr(session, sr_uuid, label, params)
+        session.call_xenapi.assert_any_call('SR.introduce', sr_uuid,
+                                            label, '', 'iscsi',
+                                            '', False, expected_params)
+
+
 class BootedFromVolumeTestCase(stubs.XenAPITestBaseNoDB):
     def test_booted_from_volume(self):
         session = mock.Mock()
@@ -259,3 +291,55 @@ class BootedFromVolumeTestCase(stubs.XenAPITestBaseNoDB):
         booted_from_volume = volume_utils.is_booted_from_volume(session,
                 'vm_ref')
         self.assertFalse(booted_from_volume)
+
+
+class MultipleVolumesTestCase(stubs.XenAPITestBaseNoDB):
+    def test_sr_info_two_luns(self):
+        data1 = {'target_portal': 'host:port',
+                 'target_iqn': 'iqn',
+                 'volume_id': 'vol_id_1',
+                 'target_lun': 1}
+        data2 = {'target_portal': 'host:port',
+                 'target_iqn': 'iqn',
+                 'volume_id': 'vol_id_2',
+                 'target_lun': 2}
+        (sr_uuid1, label1, params1) = volume_utils.parse_sr_info(data1)
+        (sr_uuid2, label2, params2) = volume_utils.parse_sr_info(data2)
+
+        self.assertEqual(sr_uuid1, sr_uuid2)
+        self.assertEqual(label1, label2)
+
+    @mock.patch.object(volume_utils, 'forget_sr')
+    def test_purge_sr_no_VBDs(self, mock_forget):
+
+        def _call_xenapi(func, *args):
+            if func == 'SR.get_VDIs':
+                return ['VDI1', 'VDI2']
+            if func == 'VDI.get_VBDs':
+                return []
+
+        self.session = mock.Mock()
+        self.session.call_xenapi = _call_xenapi
+
+        volume_utils.purge_sr(self.session, 'SR')
+
+        mock_forget.assert_called_once_with(self.session, 'SR')
+
+    @mock.patch.object(volume_utils, 'forget_sr')
+    def test_purge_sr_in_use(self, mock_forget):
+
+        def _call_xenapi(func, *args):
+            if func == 'SR.get_VDIs':
+                return ['VDI1', 'VDI2']
+            if func == 'VDI.get_VBDs':
+                if args[0] == 'VDI1':
+                    return ['VBD1']
+                if args[0] == 'VDI2':
+                    return ['VBD2']
+
+        self.session = mock.Mock()
+        self.session.call_xenapi = _call_xenapi
+
+        volume_utils.purge_sr(self.session, 'SR')
+
+        self.assertEqual([], mock_forget.mock_calls)

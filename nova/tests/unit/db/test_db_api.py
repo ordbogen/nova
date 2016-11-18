@@ -1250,6 +1250,8 @@ class MigrationTestCase(test.TestCase):
         self._create(status='reverted')
         self._create(status='confirmed')
         self._create(status='error')
+        self._create(status='failed')
+        self._create(status='accepted')
         self._create(source_compute='host2', source_node='b',
                 dest_compute='host1', dest_node='a')
         self._create(source_compute='host2', dest_compute='host3')
@@ -1276,6 +1278,8 @@ class MigrationTestCase(test.TestCase):
             self.assertNotEqual('confirmed', migration['status'])
             self.assertNotEqual('reverted', migration['status'])
             self.assertNotEqual('error', migration['status'])
+            self.assertNotEqual('failed', migration['status'])
+            self.assertNotEqual('accepted', migration['status'])
 
     def test_migration_get_in_progress_joins(self):
         self._create(source_compute='foo', system_metadata={'foo': 'bar'})
@@ -1321,6 +1325,14 @@ class MigrationTestCase(test.TestCase):
             self.assertEqual(filters["status"], migration['status'])
             hosts = [migration['source_compute'], migration['dest_compute']]
             self.assertIn(filters["host"], hosts)
+
+    def test_get_migrations_by_filters_with_multiple_statuses(self):
+        filters = {"status": ["reverted", "confirmed"],
+                   "migration_type": None, "hidden": False}
+        migrations = db.migration_get_all_by_filters(self.ctxt, filters)
+        self.assertEqual(2, len(migrations))
+        for migration in migrations:
+            self.assertIn(migration['status'], filters['status'])
 
     def test_get_migrations_by_filters_with_type(self):
         self._create(status="special", source_compute="host9",
@@ -4580,6 +4592,27 @@ class FixedIPTestCase(BaseInstanceTypeTestCase):
         fixed_ip = db.fixed_ip_get_by_address(self.ctxt, address)
         self.assertEqual(fixed_ip['instance_uuid'], instance_uuid)
 
+    def test_fixed_ip_associate_pool_order(self):
+        """Test that fixed_ip always uses oldest fixed_ip.
+
+        We should always be using the fixed ip with the oldest
+        updated_at.
+        """
+        instance_uuid = self._create_instance()
+        network = db.network_create_safe(self.ctxt, {})
+        self.addCleanup(timeutils.clear_time_override)
+        start = timeutils.utcnow()
+        for i in range(1, 4):
+            now = start - datetime.timedelta(hours=i)
+            timeutils.set_time_override(now)
+            address = self.create_fixed_ip(
+                updated_at=now,
+                address='10.1.0.%d' % i,
+                network_id=network['id'])
+        db.fixed_ip_associate_pool(self.ctxt, network['id'], instance_uuid)
+        fixed_ip = db.fixed_ip_get_by_address(self.ctxt, address)
+        self.assertEqual(fixed_ip['instance_uuid'], instance_uuid)
+
     def test_fixed_ip_associate_pool_succeeds_fip_ref_network_id_is_none(self):
         instance_uuid = self._create_instance()
         network = db.network_create_safe(self.ctxt, {})
@@ -6869,12 +6902,22 @@ class QuotaReserveNoDbTestCase(test.NoDBTestCase):
                                                     {}, {})
         self.assertFalse(overs)
 
-    def test_calculate_overquota_unlimited_quota(self):
+    def test_calculate_overquota_unlimited_user_quota(self):
         deltas = {'foo': 1}
-        project_quotas = {}
+        project_quotas = {'foo': -1}
         user_quotas = {'foo': -1}
-        project_usages = {}
-        user_usages = {'foo': 10}
+        project_usages = {'foo': {'total': 10}}
+        user_usages = {'foo': {'total': 10}}
+        overs = sqlalchemy_api._calculate_overquota(
+            project_quotas, user_quotas, deltas, project_usages, user_usages)
+        self.assertFalse(overs)
+
+    def test_calculate_overquota_unlimited_project_quota(self):
+        deltas = {'foo': 1}
+        project_quotas = {'foo': -1}
+        user_quotas = {'foo': 1}
+        project_usages = {'foo': {'total': 0}}
+        user_usages = {'foo': {'total': 0}}
         overs = sqlalchemy_api._calculate_overquota(
             project_quotas, user_quotas, deltas, project_usages, user_usages)
         self.assertFalse(overs)

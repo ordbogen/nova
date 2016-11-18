@@ -5834,84 +5834,6 @@ class ComputeTestCase(BaseTestCase):
             terminate_connection.assert_called_once_with(
                     c, 'fake-volume-id', 'fake-connector')
 
-    def _begin_post_live_migration_at_destination(self):
-        self.mox.StubOutWithMock(self.compute.network_api,
-                                 'setup_networks_on_host')
-        self.mox.StubOutWithMock(self.compute.network_api,
-                                 'migrate_instance_finish')
-        self.mox.StubOutWithMock(self.compute, '_get_power_state')
-        self.mox.StubOutWithMock(self.compute, '_get_compute_info')
-
-        params = {'task_state': task_states.MIGRATING,
-                  'power_state': power_state.PAUSED, }
-        self.instance = self._create_fake_instance_obj(params)
-
-        self.admin_ctxt = context.get_admin_context()
-
-        self.compute.network_api.setup_networks_on_host(self.admin_ctxt,
-                                                        self.instance,
-                                                        self.compute.host)
-        migration = {'source_compute': self.instance['host'],
-                     'dest_compute': self.compute.host, }
-        self.compute.network_api.migrate_instance_finish(
-                self.admin_ctxt, self.instance, migration)
-        fake_net_info = []
-        fake_block_dev_info = {'foo': 'bar'}
-        self.compute.driver.post_live_migration_at_destination(self.admin_ctxt,
-                self.instance,
-                fake_net_info,
-                False,
-                fake_block_dev_info)
-        self.compute._get_power_state(self.admin_ctxt,
-                                      self.instance).AndReturn(10001)
-
-    def _finish_post_live_migration_at_destination(self):
-        self.compute.network_api.setup_networks_on_host(self.admin_ctxt,
-                mox.IgnoreArg(), mox.IgnoreArg(), teardown=True)
-        self.compute.network_api.setup_networks_on_host(self.admin_ctxt,
-                mox.IgnoreArg(), self.compute.host)
-
-        fake_notifier.NOTIFICATIONS = []
-        self.mox.ReplayAll()
-
-        self.compute.post_live_migration_at_destination(self.admin_ctxt,
-                                                        self.instance, False)
-
-        self.assertEqual(len(fake_notifier.NOTIFICATIONS), 2)
-        msg = fake_notifier.NOTIFICATIONS[0]
-        self.assertEqual(msg.event_type,
-                         'compute.instance.live_migration.post.dest.start')
-        msg = fake_notifier.NOTIFICATIONS[1]
-        self.assertEqual(msg.event_type,
-                         'compute.instance.live_migration.post.dest.end')
-
-        return objects.Instance.get_by_uuid(self.admin_ctxt,
-                                            self.instance['uuid'])
-
-    def test_post_live_migration_at_destination_with_compute_info(self):
-        """The instance's node property should be updated correctly."""
-        self._begin_post_live_migration_at_destination()
-        hypervisor_hostname = 'fake_hypervisor_hostname'
-        fake_compute_info = objects.ComputeNode(
-            hypervisor_hostname=hypervisor_hostname)
-        self.compute._get_compute_info(mox.IgnoreArg(),
-                                       mox.IgnoreArg()).AndReturn(
-                                                        fake_compute_info)
-        updated = self._finish_post_live_migration_at_destination()
-        self.assertEqual(updated['node'], hypervisor_hostname)
-
-    def test_post_live_migration_at_destination_without_compute_info(self):
-        """The instance's node property should be set to None if we fail to
-           get compute_info.
-        """
-        self._begin_post_live_migration_at_destination()
-        self.compute._get_compute_info(
-            mox.IgnoreArg(),
-            mox.IgnoreArg()).AndRaise(
-                exception.ComputeHostNotFound(host='fake-host'))
-        updated = self._finish_post_live_migration_at_destination()
-        self.assertIsNone(updated['node'])
-
     @mock.patch('nova.objects.BlockDeviceMappingList.get_by_instance_uuid')
     def test_rollback_live_migration(self, mock_bdms):
         c = context.get_admin_context()
@@ -6664,7 +6586,7 @@ class ComputeTestCase(BaseTestCase):
         self.compute._destroy_evacuated_instances(fake_context)
         mock_get.assert_called_once_with(fake_context,
                                          {'source_compute': self.compute.host,
-                                          'status': 'accepted',
+                                          'status': ['accepted', 'done'],
                                           'migration_type': 'evacuation'})
 
     @mock.patch('nova.objects.MigrationList.get_by_filters')
@@ -11387,12 +11309,14 @@ class EvacuateHostTestCase(BaseTestCase):
         for bdm in bdms:
             db.block_device_mapping_destroy(self.context, bdm['id'])
 
-    def test_rebuild_on_host_with_shared_storage(self):
+    @mock.patch('nova.utils.get_image_from_system_metadata')
+    def test_rebuild_on_host_with_shared_storage(self, mock_image_meta):
         """Confirm evacuate scenario on shared storage."""
         self.mox.StubOutWithMock(self.compute.driver, 'spawn')
+        mock_image_meta.return_value = {'disk_format': 'qcow2'}
         self.compute.driver.spawn(mox.IsA(self.context),
-                mox.IsA(objects.Instance), {}, mox.IgnoreArg(), 'newpass',
-                network_info=mox.IgnoreArg(),
+                mox.IsA(objects.Instance), mock_image_meta.return_value,
+                mox.IgnoreArg(), 'newpass', network_info=mox.IgnoreArg(),
                 block_device_info=mox.IgnoreArg())
 
         self.stubs.Set(self.compute.driver, 'instance_on_disk', lambda x: True)
@@ -11460,11 +11384,14 @@ class EvacuateHostTestCase(BaseTestCase):
 
         self._rebuild(on_shared_storage=None)
 
-    def test_on_shared_storage_not_provided_host_with_shared_storage(self):
+    @mock.patch('nova.utils.get_image_from_system_metadata')
+    def test_on_shared_storage_not_provided_host_with_shared_storage(self,
+            mock_image_meta):
         self.mox.StubOutWithMock(self.compute.driver, 'spawn')
+        mock_image_meta.return_value = {'disk_format': 'qcow2'}
         self.compute.driver.spawn(mox.IsA(self.context),
-                mox.IsA(objects.Instance), {}, mox.IgnoreArg(), 'newpass',
-                network_info=mox.IgnoreArg(),
+                mox.IsA(objects.Instance), mock_image_meta.return_value,
+                mox.IgnoreArg(), 'newpass', network_info=mox.IgnoreArg(),
                 block_device_info=mox.IgnoreArg())
 
         self.stubs.Set(self.compute.driver, 'instance_on_disk', lambda x: True)

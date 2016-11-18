@@ -937,7 +937,13 @@ class API(base.Base):
                 block_device.properties_root_device_name(
                     boot_meta.get('properties', {})))
 
-        image_meta = objects.ImageMeta.from_dict(boot_meta)
+        try:
+            image_meta = objects.ImageMeta.from_dict(boot_meta)
+        except ValueError as e:
+            # there must be invalid values in the image meta properties so
+            # consider this an invalid request
+            msg = _('Invalid image metadata. Error: %s') % six.text_type(e)
+            raise exception.InvalidRequest(msg)
         numa_topology = hardware.numa_get_constraints(
                 instance_type, image_meta)
 
@@ -2526,7 +2532,7 @@ class API(base.Base):
             elevated, instance.uuid, 'finished')
 
         # reverse quota reservation for increased resource usage
-        deltas = compute_utils.reverse_upsize_quota_delta(context, migration)
+        deltas = compute_utils.reverse_upsize_quota_delta(context, instance)
         quotas = compute_utils.reserve_quota_delta(context, deltas, instance)
 
         instance.task_state = task_states.RESIZE_REVERTING

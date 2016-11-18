@@ -253,6 +253,23 @@ def get_client(context, admin=False):
                             region_name=CONF.neutron.region_name)
 
 
+def _is_not_duplicate(item, items, items_list_name, instance):
+    present = item in items
+
+    # The expectation from this function's perspective is that the
+    # item is not part of the items list so if it is part of it
+    # we should at least log it as a warning
+    if present:
+        LOG.warning(_LW("%(item)s already exists in list: %(list_name)s "
+                        "containing: %(items)s. ignoring it"),
+                    {'item': item,
+                     'list_name': items_list_name,
+                     'items': items},
+                    instance=instance)
+
+    return not present
+
+
 class API(base_api.NetworkAPI):
     """API for interacting with the neutron 2.x API."""
 
@@ -952,16 +969,32 @@ class API(base_api.NetworkAPI):
                                                     net_ids)
         # an interface was added/removed from instance.
         else:
-            # Since networks does not contain the existing networks on the
-            # instance we use their values from the cache and add it.
+
+            # Prepare the network ids list for validation purposes
+            networks_ids = [network['id'] for network in networks]
+
+            # Validate that interface networks doesn't exist in networks.
+            # Though this issue can and should be solved in methods
+            # that prepare the networks list, this method should have this
+            # ignore-duplicate-networks/port-ids mechanism to reduce the
+            # probability of failing to boot the VM.
             networks = networks + [
                 {'id': iface['network']['id'],
                  'name': iface['network']['label'],
                  'tenant_id': iface['network']['meta']['tenant_id']}
-                for iface in ifaces]
+                for iface in ifaces
+                if _is_not_duplicate(iface['network']['id'],
+                                     networks_ids,
+                                     "networks",
+                                     instance)]
 
             # Include existing interfaces so they are not removed from the db.
-            port_ids = [iface['id'] for iface in ifaces] + port_ids
+            # Validate that the interface id is not in the port_ids
+            port_ids = [iface['id'] for iface in ifaces
+                        if _is_not_duplicate(iface['id'],
+                                             port_ids,
+                                             "port_ids",
+                                             instance)] + port_ids
 
         return networks, port_ids
 
@@ -1507,8 +1540,18 @@ class API(base_api.NetworkAPI):
         This api call was added to allow this to be done in one operation
         if using neutron.
         """
-        self._release_floating_ip(context, floating_ip['address'],
-                                  raise_if_associated=False)
+
+        @base_api.refresh_cache
+        def _release_floating_ip_and_refresh_cache(self, context, instance,
+                                                   floating_ip):
+            self._release_floating_ip(context, floating_ip['address'],
+                                      raise_if_associated=False)
+        if instance:
+            _release_floating_ip_and_refresh_cache(self, context, instance,
+                                                   floating_ip)
+        else:
+            self._release_floating_ip(context, floating_ip['address'],
+                                      raise_if_associated=False)
 
     def _release_floating_ip(self, context, address,
                              raise_if_associated=True):
@@ -1569,10 +1612,12 @@ class API(base_api.NetworkAPI):
 
     def _nw_info_build_network(self, port, networks, subnets):
         network_name = None
+        network_mtu = None
         for net in networks:
             if port['network_id'] == net['id']:
                 network_name = net['name']
                 tenant_id = net['tenant_id']
+                network_mtu = net.get('mtu')
                 break
         else:
             tenant_id = port['tenant_id']
@@ -1615,7 +1660,8 @@ class API(base_api.NetworkAPI):
             bridge=bridge,
             injected=CONF.flat_injected,
             label=network_name,
-            tenant_id=tenant_id
+            tenant_id=tenant_id,
+            mtu=network_mtu
             )
         network['subnets'] = subnets
         port_profile = port.get('binding:profile')
@@ -1685,11 +1731,6 @@ class API(base_api.NetworkAPI):
         for current_neutron_port in current_neutron_ports:
             current_neutron_port_map[current_neutron_port['id']] = (
                 current_neutron_port)
-
-        # In that case we should repopulate ports from the state of
-        # Neutron.
-        if not port_ids:
-            port_ids = current_neutron_port_map.keys()
 
         for port_id in port_ids:
             current_neutron_port = current_neutron_port_map.get(port_id)

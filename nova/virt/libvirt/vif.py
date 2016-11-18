@@ -503,15 +503,24 @@ class LibvirtGenericVIFDriver(object):
                           process_input='0',
                           run_as_root=True,
                           check_exit_code=[0, 1])
+            disv6 = '/proc/sys/net/ipv6/conf/%s/disable_ipv6' % br_name
+            if os.path.exists(disv6):
+                utils.execute('tee',
+                              disv6,
+                              process_input='1',
+                              run_as_root=True,
+                              check_exit_code=[0, 1])
 
         if not linux_net.device_exists(v2_name):
-            linux_net._create_veth_pair(v1_name, v2_name)
+            mtu = vif['network'].get_meta('mtu')
+            linux_net._create_veth_pair(v1_name, v2_name, mtu)
             utils.execute('ip', 'link', 'set', br_name, 'up', run_as_root=True)
             utils.execute('brctl', 'addif', br_name, v1_name, run_as_root=True)
             if port == 'ovs':
                 linux_net.create_ovs_vif_port(self.get_bridge_name(vif),
                                               v2_name, iface_id,
-                                              vif['address'], instance.uuid)
+                                              vif['address'], instance.uuid,
+                                              mtu)
             elif port == 'ivs':
                 linux_net.create_ivs_vif_port(v2_name, iface_id,
                                               vif['address'], instance.uuid)
@@ -653,7 +662,9 @@ class LibvirtGenericVIFDriver(object):
         dev = self.get_vif_devname(vif)
         mac = vif['details'].get(network_model.VIF_DETAILS_TAP_MAC_ADDRESS)
         linux_net.create_tap_dev(dev, mac)
-        linux_net._set_device_mtu(dev)
+        network = vif.get('network')
+        mtu = network.get_meta('mtu') if network else None
+        linux_net._set_device_mtu(dev, mtu)
 
     def plug_vhostuser(self, instance, vif):
         ovs_plug = vif['details'].get(
@@ -663,10 +674,12 @@ class LibvirtGenericVIFDriver(object):
             iface_id = self.get_ovs_interfaceid(vif)
             port_name = os.path.basename(
                     vif['details'][network_model.VIF_DETAILS_VHOSTUSER_SOCKET])
-            linux_net.create_ovs_vif_port(self.get_bridge_name(vif),
-                                          port_name, iface_id, vif['address'],
-                                          instance.uuid)
-            linux_net.ovs_set_vhostuser_port_type(port_name)
+            mtu = vif['network'].get_meta('mtu')
+            linux_net.create_ovs_vif_port(
+                self.get_bridge_name(vif),
+                port_name, iface_id, vif['address'],
+                instance.uuid, mtu,
+                interface_type=network_model.OVS_VHOSTUSER_INTERFACE_TYPE)
 
     def plug_vrouter(self, instance, vif):
         """Plug into Contrail's network port

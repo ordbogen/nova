@@ -723,6 +723,21 @@ class TestNeutronv2(TestNeutronv2Base):
                                                None,
                                                None)
 
+    def test_get_instance_nw_info_ignores_neutron_ports_empty_cache(self):
+        # Tests that ports returned from neutron that match the same
+        # instance_id/device_id are ignored when the instance info cache is
+        # empty.
+        port_data2 = copy.copy(self.port_data2)
+
+        # set device_id on the ports to be the same.
+        port_data2[1]['device_id'] = port_data2[0]['device_id']
+        network_cache = {'info_cache': {'network_info': []}}
+
+        self._fake_get_instance_nw_info_helper(network_cache,
+                                               port_data2,
+                                               None,
+                                               None)
+
     def _fake_get_instance_nw_info_helper(self, network_cache,
                                           current_neutron_ports,
                                           networks=None, port_ids=None):
@@ -762,8 +777,26 @@ class TestNeutronv2(TestNeutronv2Base):
                      'tenant_id': iface['network']['meta']['tenant_id']}
                     for iface in ifaces]
         if networks is None:
-            self.moxed_client.list_networks(
-                id=net_ids).AndReturn({'networks': nets})
+            if ifaces:
+                self.moxed_client.list_networks(
+                    id=net_ids).AndReturn({'networks': nets})
+            else:
+                non_shared_nets = [
+                    {'id': iface['network']['id'],
+                     'name': iface['network']['label'],
+                     'tenant_id': iface['network']['meta']['tenant_id']}
+                    for iface in ifaces if not iface['shared']]
+                shared_nets = [
+                    {'id': iface['network']['id'],
+                     'name': iface['network']['label'],
+                     'tenant_id': iface['network']['meta']['tenant_id']}
+                    for iface in ifaces if iface['shared']]
+                self.moxed_client.list_networks(
+                    shared=False,
+                    tenant_id=self.instance['project_id']
+                        ).AndReturn({'networks': non_shared_nets})
+                self.moxed_client.list_networks(
+                    shared=True).AndReturn({'networks': shared_nets})
         else:
             networks = networks + [
                 dict(id=iface['network']['id'],
@@ -2174,6 +2207,21 @@ class TestNeutronv2(TestNeutronv2Base):
         api.disassociate_and_release_floating_ip(self.context, None,
                                                floating_ip)
 
+    def test_disassociate_and_release_floating_ip_with_instance(self):
+        api = neutronapi.API()
+        address = self.fip_unassociated['floating_ip_address']
+        fip_id = self.fip_unassociated['id']
+        floating_ip = {'address': address}
+        instance = self._fake_instance_object(self.instance)
+
+        self.moxed_client.list_floatingips(floating_ip_address=address).\
+            AndReturn({'floatingips': [self.fip_unassociated]})
+        self.moxed_client.delete_floatingip(fip_id)
+        self._setup_mock_for_refresh_cache(api, [instance])
+        self.mox.ReplayAll()
+        api.disassociate_and_release_floating_ip(self.context, instance,
+                                                 floating_ip)
+
     def test_release_floating_ip_associated(self):
         api = neutronapi.API()
         address = self.fip_associated['floating_ip_address']
@@ -2391,7 +2439,8 @@ class TestNeutronv2(TestNeutronv2Base):
             'binding:vif_type': vif_type,
             }
         fake_subnets = [model.Subnet(cidr='1.0.0.0/8')]
-        fake_nets = [{'id': 'net-id', 'name': 'foo', 'tenant_id': 'tenant'}]
+        fake_nets = [{'id': 'net-id', 'name': 'foo', 'tenant_id': 'tenant',
+                      'mtu': 9000}]
         api = neutronapi.API()
         self.mox.ReplayAll()
         neutronapi.get_client('fake')
@@ -2401,6 +2450,7 @@ class TestNeutronv2(TestNeutronv2Base):
         self.assertEqual(net['id'], 'net-id')
         self.assertEqual(net['label'], 'foo')
         self.assertEqual(net.get_meta('tenant_id'), 'tenant')
+        self.assertEqual(9000, net.get_meta('mtu'))
         self.assertEqual(net.get_meta('injected'), CONF.flat_injected)
         return net, iid
 
@@ -2667,6 +2717,8 @@ class TestNeutronv2(TestNeutronv2Base):
             mock_nw_info_build_network,
             mock_nw_info_get_ips,
             mock_nw_info_get_subnets):
+        # An empty instance info network cache should not be populated from
+        # ports found in Neutron.
         api = neutronapi.API()
 
         fake_inst = objects.Instance()
@@ -2695,7 +2747,7 @@ class TestNeutronv2(TestNeutronv2Base):
             tenant_id='fake', device_id='uuid').AndReturn(
                 {'ports': fake_ports})
 
-        mock_gather_port_ids_and_networks.return_value = (None, None)
+        mock_gather_port_ids_and_networks.return_value = ([], [])
         mock_get_preexisting_port_ids.return_value = []
         mock_nw_info_build_network.return_value = (None, None)
         mock_nw_info_get_ips.return_value = []
@@ -2706,7 +2758,7 @@ class TestNeutronv2(TestNeutronv2Base):
 
         nw_infos = api._build_network_info_model(
             self.context, fake_inst)
-        self.assertEqual(len(nw_infos), 1)
+        self.assertEqual(0, len(nw_infos))
 
     def test_get_subnets_from_port(self):
         api = neutronapi.API()
@@ -2848,6 +2900,58 @@ class TestNeutronv2WithMock(test.TestCase):
         self.assertRaises(test.TestingException,
                           api.get_instance_nw_info, 'context', instance)
         mock_lock.assert_called_once_with('refresh_cache-%s' % instance.uuid)
+
+    @mock.patch('nova.network.neutronv2.api.LOG')
+    def test_get_instance_nw_info_verify_duplicates_ignored(self, mock_log):
+        """test that the returned networks & port_ids from
+        _gather_port_ids_and_networks doesn't contain any duplicates
+
+        The test fakes an instance with two ports connected to two networks.
+        The _gather_port_ids_and_networks method will be called with the
+        instance and a list of port ids of which one port id is configured
+        already to the instance (== duplicate #1) and a list of
+        networks that already contains a network to which an instance port
+        is connected (== duplicate #2).
+
+        All-in-all, we expect the resulting port ids list to contain 3 items
+        (["instance_port_1", "port_1", "port_2"]) and the resulting networks
+        list to contain 3 items (["net_1", "net_2", "instance_network_1"])
+        while the warning message for duplicate items was executed twice
+        (due to "duplicate #1" & "duplicate #2")
+        """
+
+        networks = [model.Network(id="net_1"),
+                    model.Network(id="net_2")]
+        port_ids = ["port_1", "port_2"]
+
+        instance_networks = [{"id": "instance_network_1",
+                              "name": "fake_network",
+                              "tenant_id": "fake_tenant_id"}]
+        instance_port_ids = ["instance_port_1"]
+
+        network_info = model.NetworkInfo(
+            [{'id': port_ids[0],
+              'network': networks[0]},
+             {'id': instance_port_ids[0],
+              'network': model.Network(
+                  id=instance_networks[0]["id"],
+                  label=instance_networks[0]["name"],
+                  meta={"tenant_id": instance_networks[0]["tenant_id"]})}]
+        )
+
+        instance_uuid = uuid.uuid4()
+        instance = objects.Instance(uuid=instance_uuid,
+                                    info_cache=objects.InstanceInfoCache(
+                                        context=self.context,
+                                        instance_uuid=instance_uuid,
+                                        network_info=network_info))
+
+        new_networks, new_port_ids = self.api._gather_port_ids_and_networks(
+            self.context, instance, networks, port_ids)
+
+        self.assertEqual(new_networks, networks + instance_networks)
+        self.assertEqual(new_port_ids, instance_port_ids + port_ids)
+        self.assertEqual(2, mock_log.warning.call_count)
 
     @mock.patch('oslo_concurrency.lockutils.lock')
     @mock.patch.object(neutronapi.API, '_get_instance_nw_info')

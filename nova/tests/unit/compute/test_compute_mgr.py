@@ -23,6 +23,7 @@ from mox3 import mox
 import netaddr
 from oslo_config import cfg
 import oslo_messaging as messaging
+from oslo_serialization import jsonutils
 from oslo_utils import importutils
 from oslo_utils import timeutils
 from oslo_utils import uuidutils
@@ -1102,6 +1103,10 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase):
 
     def test_shutdown_instance_disk_not_found(self):
         exc = exception.DiskNotFound
+        self._test_shutdown_instance_exception(exc)
+
+    def test_shutdown_instance_other_exception(self):
+        exc = Exception('some other exception')
         self._test_shutdown_instance_exception(exc)
 
     def _test_init_instance_retries_reboot(self, instance, reboot_type,
@@ -2188,6 +2193,8 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase):
         bdm.device_name = 'vdb'
         bdm_get.return_value = bdm
 
+        detach.return_value = {}
+
         with mock.patch.object(self.compute, 'volume_api') as volume_api:
             with mock.patch.object(self.compute, 'driver') as driver:
                 connector_sentinel = mock.sentinel.connector
@@ -2211,6 +2218,90 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase):
                     bdm.destroy.assert_called_once_with()
                 else:
                     self.assertFalse(bdm.destroy.called)
+
+    def test_detach_volume_evacuate(self):
+        """For evacuate, terminate_connection is called with original host."""
+        expected_connector = {'host': 'evacuated-host'}
+        conn_info_str = '{"connector": {"host": "evacuated-host"}}'
+        self._test_detach_volume_evacuate(conn_info_str,
+                                          expected=expected_connector)
+
+    def test_detach_volume_evacuate_legacy(self):
+        """Test coverage for evacuate with legacy attachments.
+
+        In this case, legacy means the volume was attached to the instance
+        before nova stashed the connector in connection_info. The connector
+        sent to terminate_connection will still be for the local host in this
+        case because nova does not have the info to get the connector for the
+        original (evacuated) host.
+        """
+        conn_info_str = '{"foo": "bar"}'  # Has no 'connector'.
+        self._test_detach_volume_evacuate(conn_info_str)
+
+    def test_detach_volume_evacuate_mismatch(self):
+        """Test coverage for evacuate with connector mismatch.
+
+        For evacuate, if the stashed connector also has the wrong host,
+        then log it and stay with the local connector.
+        """
+        conn_info_str = '{"connector": {"host": "other-host"}}'
+        self._test_detach_volume_evacuate(conn_info_str)
+
+    @mock.patch('nova.objects.BlockDeviceMapping.get_by_volume_id')
+    @mock.patch('nova.compute.manager.ComputeManager.'
+                '_notify_about_instance_usage')
+    def _test_detach_volume_evacuate(self, conn_info_str, notify_inst_usage,
+                                     bdm_get, expected=None):
+        """Re-usable code for detach volume evacuate test cases.
+
+        :param conn_info_str: String form of the stashed connector.
+        :param expected: Dict of the connector that is expected in the
+                         terminate call (optional). Default is to expect the
+                         local connector to be used.
+        """
+        volume_id = 'vol_id'
+        instance = fake_instance.fake_instance_obj(self.context,
+                                                   host='evacuated-host')
+        bdm = mock.Mock()
+        bdm.connection_info = conn_info_str
+        bdm_get.return_value = bdm
+
+        local_connector = {'host': 'local-connector-host'}
+        expected_connector = local_connector if not expected else expected
+
+        with mock.patch.object(self.compute, 'volume_api') as volume_api:
+            with mock.patch.object(self.compute, 'driver') as driver:
+                driver.get_volume_connector.return_value = local_connector
+
+                self.compute._detach_volume(self.context,
+                                            volume_id,
+                                            instance,
+                                            destroy_bdm=False)
+
+                driver.get_volume_connector.assert_called_once_with(instance)
+                volume_api.terminate_connection.assert_called_once_with(
+                    self.context, volume_id, expected_connector)
+                volume_api.detach.assert_called_once_with(mock.ANY, volume_id)
+                notify_inst_usage.assert_called_once_with(
+                    self.context, instance, "volume.detach",
+                    extra_usage_info={'volume_id': volume_id}
+                )
+
+    def test__driver_detach_volume_return(self):
+        """_driver_detach_volume returns the connection_info from loads()."""
+        with mock.patch.object(jsonutils, 'loads') as loads:
+            conn_info_str = 'test-expected-loads-param'
+            bdm = mock.Mock()
+            bdm.connection_info = conn_info_str
+            loads.return_value = {'test-loads-key': 'test loads return value'}
+            instance = fake_instance.fake_instance_obj(self.context)
+
+            ret = self.compute._driver_detach_volume(self.context,
+                                                     instance,
+                                                     bdm)
+
+            self.assertEqual(loads.return_value, ret)
+            loads.assert_called_once_with(conn_info_str)
 
     def _test_rescue(self, clean_shutdown=True):
         instance = fake_instance.fake_instance_obj(
@@ -2457,6 +2548,8 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase):
 
         # Only instance 2 has a migration record
         migration = objects.Migration(instance_uuid=instance_2.uuid)
+        # Consider the migration successful
+        migration.status = 'done'
 
         with contextlib.nested(
             mock.patch.object(self.compute, '_get_instances_on_driver',
@@ -3508,6 +3601,10 @@ class ComputeManagerBuildInstanceTestCase(test.NoDBTestCase):
             exception.ImageUnacceptable(image_id=self.image.get('id'),
                                         reason=""))
 
+    def test_build_and_run_invalid_disk_info_exception(self):
+        self._test_build_and_run_spawn_exceptions(
+            exception.InvalidDiskInfo(reason=""))
+
     def _test_build_and_run_spawn_exceptions(self, exc):
         with contextlib.nested(
                 mock.patch.object(self.compute.driver, 'spawn',
@@ -4239,3 +4336,122 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase):
         self.assertEqual(0, compute._live_migration_semaphore.balance)
         self.assertIsInstance(compute._live_migration_semaphore,
                               compute_utils.UnlimitedSemaphore)
+
+    def test_post_live_migration_at_destination_success(self):
+
+        @mock.patch.object(self.instance, 'save')
+        @mock.patch.object(self.compute.network_api, 'get_instance_nw_info',
+                           return_value='test_network')
+        @mock.patch.object(self.compute.network_api, 'setup_networks_on_host')
+        @mock.patch.object(self.compute.network_api, 'migrate_instance_finish')
+        @mock.patch.object(self.compute, '_notify_about_instance_usage')
+        @mock.patch.object(self.compute, '_get_instance_block_device_info')
+        @mock.patch.object(self.compute, '_get_power_state', return_value=1)
+        @mock.patch.object(self.compute, '_get_compute_info')
+        @mock.patch.object(self.compute.driver,
+                           'post_live_migration_at_destination')
+        def _do_test(post_live_migration_at_destination, _get_compute_info,
+                     _get_power_state, _get_instance_block_device_info,
+                     _notify_about_instance_usage, migrate_instance_finish,
+                     setup_networks_on_host, get_instance_nw_info, save):
+
+            cn = mock.Mock(spec_set=['hypervisor_hostname'])
+            cn.hypervisor_hostname = 'test_host'
+            _get_compute_info.return_value = cn
+            cn_old = self.instance.host
+            instance_old = self.instance
+
+            self.compute.post_live_migration_at_destination(
+                self.context, self.instance, False)
+
+            setup_networks_calls = [
+                mock.call(self.context, self.instance, self.compute.host),
+                mock.call(self.context, self.instance, cn_old, teardown=True),
+                mock.call(self.context, self.instance, self.compute.host)
+            ]
+            setup_networks_on_host.assert_has_calls(setup_networks_calls)
+
+            notify_usage_calls = [
+                mock.call(self.context, instance_old,
+                          "live_migration.post.dest.start",
+                          network_info='test_network'),
+                mock.call(self.context, self.instance,
+                          "live_migration.post.dest.end",
+                          network_info='test_network')
+            ]
+            _notify_about_instance_usage.assert_has_calls(notify_usage_calls)
+
+            migrate_instance_finish.assert_called_once_with(
+                self.context, self.instance,
+                {'source_compute': cn_old,
+                 'dest_compute': self.compute.host})
+            _get_instance_block_device_info.assert_called_once_with(
+                self.context, self.instance
+            )
+            get_instance_nw_info.assert_called_once_with(self.context,
+                                                         self.instance)
+            _get_power_state.assert_called_once_with(self.context,
+                                                     self.instance)
+            _get_compute_info.assert_called_once_with(self.context,
+                                                      self.compute.host)
+
+            self.assertEqual(self.compute.host, self.instance.host)
+            self.assertEqual('test_host', self.instance.node)
+            self.assertEqual(1, self.instance.power_state)
+            self.assertIsNone(self.instance.task_state)
+            save.assert_called_once_with(
+                expected_task_state=task_states.MIGRATING)
+
+        _do_test()
+
+    def test_post_live_migration_at_destination_compute_not_found(self):
+
+        @mock.patch.object(self.instance, 'save')
+        @mock.patch.object(self.compute, 'network_api')
+        @mock.patch.object(self.compute, '_notify_about_instance_usage')
+        @mock.patch.object(self.compute, '_get_instance_block_device_info')
+        @mock.patch.object(self.compute, '_get_power_state', return_value=1)
+        @mock.patch.object(self.compute, '_get_compute_info',
+                           side_effect=exception.ComputeHostNotFound(
+                               host='fake'))
+        @mock.patch.object(self.compute.driver,
+                           'post_live_migration_at_destination')
+        def _do_test(post_live_migration_at_destination, _get_compute_info,
+                     _get_power_state, _get_instance_block_device_info,
+                     _notify_about_instance_usage, network_api, save):
+            cn = mock.Mock(spec_set=['hypervisor_hostname'])
+            cn.hypervisor_hostname = 'test_host'
+            _get_compute_info.return_value = cn
+
+            self.compute.post_live_migration_at_destination(
+                self.context, self.instance, False)
+            self.assertIsNone(self.instance.node)
+
+        _do_test()
+
+    def test_post_live_migration_at_destination_unexpected_exception(self):
+
+        @mock.patch.object(compute_utils, 'add_instance_fault_from_exc')
+        @mock.patch.object(self.instance, 'save')
+        @mock.patch.object(self.compute, 'network_api')
+        @mock.patch.object(self.compute, '_notify_about_instance_usage')
+        @mock.patch.object(self.compute, '_get_instance_block_device_info')
+        @mock.patch.object(self.compute, '_get_power_state', return_value=1)
+        @mock.patch.object(self.compute, '_get_compute_info')
+        @mock.patch.object(self.compute.driver,
+                           'post_live_migration_at_destination',
+                           side_effect=exception.NovaException)
+        def _do_test(post_live_migration_at_destination, _get_compute_info,
+                     _get_power_state, _get_instance_block_device_info,
+                     _notify_about_instance_usage, network_api, save,
+                     add_instance_fault_from_exc):
+            cn = mock.Mock(spec_set=['hypervisor_hostname'])
+            cn.hypervisor_hostname = 'test_host'
+            _get_compute_info.return_value = cn
+
+            self.assertRaises(exception.NovaException,
+                              self.compute.post_live_migration_at_destination,
+                              self.context, self.instance, False)
+            self.assertEqual(vm_states.ERROR, self.instance.vm_state)
+
+        _do_test()
