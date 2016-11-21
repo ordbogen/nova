@@ -1630,6 +1630,11 @@ class LinuxBridgeInterfaceDriver(LinuxNetInterfaceDriver):
             _execute('brctl', 'setfd', bridge, 0, run_as_root=True)
             # _execute('brctl setageing %s 10' % bridge, run_as_root=True)
             _execute('brctl', 'stp', bridge, 'off', run_as_root=True)
+            _execute('tee',
+                     ('/sys/class/net/%s/bridge/vlan_filtering' % bridge),
+                     process_input='1',
+                     run_as_root=True,
+                     check_exit_code=[0, 1])
             _execute('ip', 'link', 'set', bridge, 'up', run_as_root=True)
 
         if interface:
