@@ -39,6 +39,7 @@ blkid: CommandFilter, blkid, root
 blockdev: RegExpFilter, blockdev, root, blockdev, (--getsize64|--flushbufs), /dev/.*
 
 # nova/virt/disk/vfs/localfs.py: 'tee', canonpath
+# nova/network/linux_net.py: 'tee', canonpath
 tee: CommandFilter, tee, root
 
 # nova/virt/disk/vfs/localfs.py: 'mkdir', canonpath
